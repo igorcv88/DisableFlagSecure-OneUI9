@@ -10,12 +10,15 @@ android {
     }
     buildToolsVersion "36.1.0"
 
+    def releaseVersionCode = providers.gradleProperty("releaseVersionCode").orNull
+    def releaseVersionName = providers.gradleProperty("releaseVersionName").orNull
+
     defaultConfig {
         applicationId "io.github.lsposed.disableflagsecure"
         minSdkVersion 31
         targetSdkVersion 37
-        versionCode rootProject.ext.commitCount
-        versionName "5.0.1"
+        versionCode releaseVersionCode != null ? Integer.parseInt(releaseVersionCode) : rootProject.ext.commitCount
+        versionName releaseVersionName ?: "5.0.1"
     }
 
     Properties localProperties = new Properties()
@@ -23,13 +26,18 @@ android {
         localProperties.load(project.rootProject.file('local.properties').newDataInputStream())
     }
 
+    def storeFilePath = System.getenv("RELEASE_STORE_FILE") ?: localProperties.getProperty("storeFile")
+    def storePasswordValue = System.getenv("RELEASE_STORE_PASSWORD") ?: localProperties.getProperty("storePassword")
+    def keyAliasValue = System.getenv("RELEASE_KEY_ALIAS") ?: localProperties.getProperty("keyAlias")
+    def keyPasswordValue = System.getenv("RELEASE_KEY_PASSWORD") ?: localProperties.getProperty("keyPassword")
+
     signingConfigs {
-        if (localProperties.getProperty("storeFile") != null) {
+        if (storeFilePath != null) {
             config {
-                storeFile project.rootProject.file(localProperties.getProperty("storeFile"))
-                storePassword localProperties.getProperty("storePassword")
-                keyAlias localProperties.getProperty("keyAlias")
-                keyPassword localProperties.getProperty("keyPassword")
+                storeFile project.rootProject.file(storeFilePath)
+                storePassword storePasswordValue
+                keyAlias keyAliasValue
+                keyPassword keyPasswordValue
             }
         }
     }
@@ -40,12 +48,12 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
         debug {
-            if (localProperties.getProperty("storeFile") != null) {
+            if (storeFilePath != null) {
                 signingConfig signingConfigs.config
             }
         }
         release {
-            if (localProperties.getProperty("storeFile") != null) {
+            if (storeFilePath != null) {
                 signingConfig signingConfigs.config
             } else {
                 signingConfig signingConfigs.debug
