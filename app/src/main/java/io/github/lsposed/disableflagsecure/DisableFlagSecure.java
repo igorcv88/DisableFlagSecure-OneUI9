@@ -15,6 +15,7 @@ import androidx.annotation.RequiresApi;
 import java.lang.reflect.Executable;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.function.BiConsumer;
 import java.util.function.BiPredicate;
@@ -103,14 +104,19 @@ public class DisableFlagSecure extends XposedModule {
             log(Log.ERROR, TAG, "hook DisplayControl failed", t);
         }
 
-        // VirtualDisplay with MediaProjection (S~Baklava)
+        // VirtualDisplay with MediaProjection. Android 17 / One UI 9 moves the
+        // effective creation path out of VirtualDisplayAdapter on some builds,
+        // so fall back to DisplayManagerService when no adapter method is present.
         try {
-            hookVirtualDisplayAdapter(classLoader);
+            if (hookVirtualDisplayAdapter(classLoader) == 0) {
+                hookDisplayManagerService(classLoader);
+            }
         } catch (Throwable t) {
-            log(Log.ERROR, TAG, "hook VirtualDisplayAdapter failed", t);
+            log(Log.ERROR, TAG, "hook VirtualDisplay creation failed", t);
         }
 
-        // OneUI
+        // Secure-layer result metadata. ScreenCaptureInternal replaced
+        // ScreenCapture for this type on Android 17 / recent Baklava branches.
         try {
             hookScreenshotHardwareBuffer(classLoader);
         } catch (Throwable t) {
@@ -169,10 +175,9 @@ public class DisableFlagSecure extends XposedModule {
                         }
                     }
                 }
+                // fall through
             case FLYME_SYSTEMUIEX:
             case OPLUS_APPPLATFORM:
-                // Flyme SystemUI Ext 10.3.0
-                // OPlus AppPlatform 13.1.0 / 14.0.0
                 try {
                     hookScreenshotHardwareBuffer(classLoader);
                 } catch (Throwable t) {
@@ -180,8 +185,20 @@ public class DisableFlagSecure extends XposedModule {
                         log(Log.ERROR, TAG, "hook ScreenshotHardwareBuffer failed", t);
                     }
                 }
+                // fall through
             case SYSTEMUI:
             case MIUI_SCREENSHOT:
+                // Android 17 / One UI 9 may inspect the returned hardware buffer
+                // inside SystemUI, not only inside system_server.
+                if (SYSTEMUI.equals(packageName) || MIUI_SCREENSHOT.equals(packageName)) {
+                    try {
+                        hookScreenshotHardwareBuffer(classLoader);
+                    } catch (Throwable t) {
+                        if (!(t instanceof ClassNotFoundException)) {
+                            log(Log.ERROR, TAG, "hook ScreenshotHardwareBuffer in screenshot process failed", t);
+                        }
+                    }
+                }
                 if (OPLUS_APPPLATFORM.equals(packageName) || OPLUS_SCREENSHOT.equals(packageName) ||
                         Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                     // ScreenCapture in App (S~T) (OPlus S~V)
@@ -296,10 +313,15 @@ public class DisableFlagSecure extends XposedModule {
         });
     }
 
+    private boolean usesScreenCaptureInternal() {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA &&
+                Build.VERSION.SDK_INT_FULL >= Build.VERSION_CODES_FULL.BAKLAVA_1;
+    }
+
     private void hookScreenCapture(ClassLoader classLoader) throws ClassNotFoundException, NoSuchFieldException {
         Class<?> screenCaptureClazz;
         Class<?> captureArgsClazz;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA && Build.VERSION.SDK_INT_FULL >= Build.VERSION_CODES_FULL.BAKLAVA_1) {
+        if (usesScreenCaptureInternal()) {
             screenCaptureClazz = classLoader.loadClass("android.window.ScreenCaptureInternal");
             captureArgsClazz = classLoader.loadClass("android.window.ScreenCaptureInternal$CaptureArgs");
         } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -309,14 +331,13 @@ public class DisableFlagSecure extends XposedModule {
             screenCaptureClazz = SurfaceControl.class;
             captureArgsClazz = classLoader.loadClass("android.view.SurfaceControl$CaptureArgs");
         }
-        var captureSecureLayersField = captureArgsClazz.getDeclaredField(Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA &&
-                Build.VERSION.SDK_INT_FULL >= Build.VERSION_CODES_FULL.BAKLAVA_1 ? "mSecureContentPolicy" : "mCaptureSecureLayers");
+        var captureSecureLayersField = captureArgsClazz.getDeclaredField(
+                usesScreenCaptureInternal() ? "mSecureContentPolicy" : "mCaptureSecureLayers");
         captureSecureLayersField.setAccessible(true);
         Hooker hooker = chain -> {
             var captureArgs = chain.getArg(0);
             try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA &&
-                        Build.VERSION.SDK_INT_FULL >= Build.VERSION_CODES_FULL.BAKLAVA_1) {
+                if (usesScreenCaptureInternal()) {
                     captureSecureLayersField.set(captureArgs, 1);
                 } else {
                     captureSecureLayersField.set(captureArgs, true);
@@ -359,26 +380,57 @@ public class DisableFlagSecure extends XposedModule {
         });
     }
 
-    private void hookVirtualDisplayAdapter(ClassLoader classLoader) throws ClassNotFoundException {
-        var displayControlClazz = classLoader.loadClass("com.android.server.display.VirtualDisplayAdapter");
-        hookMethods(displayControlClazz, chain -> {
-            var caller = (int) chain.getArg(2);
-            if (caller >= 10000 && chain.getArg(1) == null) {
-                // not os and not media projection
-                return chain.proceed();
-            }
-            for (int i = 3; i < chain.getArgs().size(); i++) {
-                var arg = chain.getArg(i);
-                if (arg instanceof Integer flags) {
-                    flags |= DisplayManager.VIRTUAL_DISPLAY_FLAG_SECURE;
-                    var args = chain.getArgs().toArray();
-                    args[i] = flags;
-                    return chain.proceed(args);
+    private int hookVirtualDisplayAdapter(ClassLoader classLoader) throws ClassNotFoundException {
+        var virtualDisplayAdapterClazz = classLoader.loadClass("com.android.server.display.VirtualDisplayAdapter");
+        return hookVirtualDisplayCreationMethods(virtualDisplayAdapterClazz);
+    }
+
+    private int hookDisplayManagerService(ClassLoader classLoader) throws ClassNotFoundException {
+        var displayManagerServiceClazz = classLoader.loadClass("com.android.server.display.DisplayManagerService");
+        return hookVirtualDisplayCreationMethods(displayManagerServiceClazz);
+    }
+
+    private int hookVirtualDisplayCreationMethods(Class<?> clazz) {
+        var methods = Arrays.stream(clazz.getDeclaredMethods())
+                .filter(method -> method.getName().equals("createVirtualDisplayLocked"))
+                .toList();
+        var hooked = 0;
+
+        for (var method : methods) {
+            var parameterTypes = method.getParameterTypes();
+            var flagsIndex = -1;
+            for (int i = parameterTypes.length - 1; i >= 0; i--) {
+                if (parameterTypes[i] == int.class) {
+                    flagsIndex = i;
+                    break;
                 }
             }
-            module.log(Log.WARN, TAG, "flag not found in CreateVirtualDisplayLockedHooker");
-            return chain.proceed();
-        }, "createVirtualDisplayLocked");
+            if (flagsIndex < 0) {
+                module.log(Log.WARN, TAG,
+                        "No int flags parameter found in " + method.toGenericString());
+                continue;
+            }
+
+            final int secureFlagsIndex = flagsIndex;
+            hookE(method).intercept(chain -> {
+                if (chain.getArgs().size() > 2 && chain.getArg(2) instanceof Integer caller &&
+                        caller >= 10000 && chain.getArg(1) == null) {
+                    // not os and not media projection
+                    return chain.proceed();
+                }
+
+                var args = chain.getArgs().toArray();
+                if (!(args[secureFlagsIndex] instanceof Integer flags)) {
+                    module.log(Log.WARN, TAG,
+                            "Unexpected virtual display flags argument in " + method.toGenericString());
+                    return chain.proceed();
+                }
+                args[secureFlagsIndex] = flags | DisplayManager.VIRTUAL_DISPLAY_FLAG_SECURE;
+                return chain.proceed(args);
+            });
+            hooked++;
+        }
+        return hooked;
     }
 
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
@@ -418,13 +470,31 @@ public class DisableFlagSecure extends XposedModule {
         hookMethods(windowManagerServiceImplClazz, chain -> false, "notAllowCaptureDisplay");
     }
 
-    private void hookScreenshotHardwareBuffer(ClassLoader classLoader) throws ClassNotFoundException, NoSuchMethodException {
-        var screenshotHardwareBufferClazz = classLoader.loadClass(
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE ?
-                        "android.window.ScreenCapture$ScreenshotHardwareBuffer" :
+    private void hookScreenshotHardwareBuffer(ClassLoader classLoader)
+            throws ClassNotFoundException, NoSuchMethodException {
+        var candidates = usesScreenCaptureInternal() ?
+                List.of(
+                        "android.window.ScreenCaptureInternal$ScreenshotHardwareBuffer",
+                        "android.window.ScreenCapture$ScreenshotHardwareBuffer",
+                        "android.view.SurfaceControl$ScreenshotHardwareBuffer") :
+                List.of(
+                        "android.window.ScreenCapture$ScreenshotHardwareBuffer",
                         "android.view.SurfaceControl$ScreenshotHardwareBuffer");
-        var method = screenshotHardwareBufferClazz.getDeclaredMethod("containsSecureLayers");
-        hookE(method).intercept(chain -> false);
+
+        ClassNotFoundException lastClassNotFound = null;
+        for (var className : candidates) {
+            try {
+                var screenshotHardwareBufferClazz = classLoader.loadClass(className);
+                var method = screenshotHardwareBufferClazz.getDeclaredMethod("containsSecureLayers");
+                hookE(method).intercept(chain -> false);
+                return;
+            } catch (ClassNotFoundException e) {
+                lastClassNotFound = e;
+            }
+        }
+
+        if (lastClassNotFound != null) throw lastClassNotFound;
+        throw new ClassNotFoundException("ScreenshotHardwareBuffer implementation not found");
     }
 
     @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
@@ -444,16 +514,28 @@ public class DisableFlagSecure extends XposedModule {
         hookMethods(longshotMainClazz, chain -> false, "hasSecure");
     }
 
-    private void hookOneUI(ClassLoader classLoader) throws ClassNotFoundException {
+    private void hookOneUI(ClassLoader classLoader) throws ClassNotFoundException, NoSuchMethodException {
         var wmScreenshotControllerClazz = classLoader.loadClass("com.android.server.wm.WmScreenshotController");
-        hookMethods(wmScreenshotControllerClazz, chain -> true, "canBeScreenshotTarget");
+        var candidateNames = Set.of("canBeScreenshotTarget", "isCaptureTarget");
+        var methods = Arrays.stream(wmScreenshotControllerClazz.getDeclaredMethods())
+                .filter(method -> method.getReturnType() == boolean.class)
+                .filter(method -> candidateNames.contains(method.getName()))
+                .toList();
+
+        if (methods.isEmpty()) {
+            throw new NoSuchMethodException(
+                    "No supported One UI screenshot-target method in WmScreenshotController");
+        }
+        methods.forEach(method -> hookE(method).intercept(chain -> true));
     }
 
-    private void hookMethods(Class<?> clazz, Hooker hooker, String... names) {
+    private int hookMethods(Class<?> clazz, Hooker hooker, String... names) {
         var list = Arrays.asList(names);
-        Arrays.stream(clazz.getDeclaredMethods())
+        var methods = Arrays.stream(clazz.getDeclaredMethods())
                 .filter(method -> list.contains(method.getName()))
-                .forEach(method -> hookE(method).intercept(hooker));
+                .toList();
+        methods.forEach(method -> hookE(method).intercept(hooker));
+        return methods.size();
     }
 
     private HookBuilder hookE(Executable executable) {
