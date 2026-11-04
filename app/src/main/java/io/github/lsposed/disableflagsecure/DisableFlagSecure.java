@@ -393,7 +393,7 @@ public class DisableFlagSecure extends XposedModule {
     private int hookVirtualDisplayCreationMethods(Class<?> clazz) {
         var methods = Arrays.stream(clazz.getDeclaredMethods())
                 .filter(method -> method.getName().equals("createVirtualDisplayLocked"))
-                .toList();
+                .collect(java.util.stream.Collectors.toList());
         var hooked = 0;
 
         for (var method : methods) {
@@ -520,7 +520,7 @@ public class DisableFlagSecure extends XposedModule {
         var methods = Arrays.stream(wmScreenshotControllerClazz.getDeclaredMethods())
                 .filter(method -> method.getReturnType() == boolean.class)
                 .filter(method -> candidateNames.contains(method.getName()))
-                .toList();
+                .collect(java.util.stream.Collectors.toList());
 
         if (methods.isEmpty()) {
             throw new NoSuchMethodException(
@@ -533,7 +533,7 @@ public class DisableFlagSecure extends XposedModule {
         var list = Arrays.asList(names);
         var methods = Arrays.stream(clazz.getDeclaredMethods())
                 .filter(method -> list.contains(method.getName()))
-                .toList();
+                .collect(java.util.stream.Collectors.toList());
         methods.forEach(method -> hookE(method).intercept(hooker));
         return methods.size();
     }
